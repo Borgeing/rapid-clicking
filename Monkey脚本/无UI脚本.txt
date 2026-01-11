@@ -1,0 +1,253 @@
+// ==UserScript==
+// @name         通用自定义连点器(无UI界面)
+// @namespace    https://tampermonkey.net/
+// @version      1.0
+// @description  在网页上对任意元素进行自动连点，可通过快捷键选择目标和控制开关。
+// @author       You
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /************* 配置区（可按需修改） *************/
+    /*疑似每每1000毫秒点一个赞，期间不退出重进,约五小时连续无限制提示.
+
+      每950毫秒点一个赞,每180秒自动退出重进一次直播间约用时10秒,约五小时连续无限制提示
+
+      每950毫秒点一个赞，每240秒自动退出重进一次直播间约用时10秒,约1个半小时到2小时左右提示受限制.*/
+
+    // 连点间隔（毫秒），数值越小点得越快，例如 100 = 每秒约 10 次
+    let CLICK_INTERVAL_MS = 1000;
+
+    // 每轮最多点击次数，达到后会空闲一小段时间再继续
+    let MAX_CLICK_PER_BATCH = 3000;
+
+    // 每轮结束后的休息时间（毫秒）
+    let REST_AFTER_BATCH_MS = 50000;
+
+    // 快捷键配置
+    const HOTKEY_TOGGLE = { ctrlKey: true, altKey: true, key: 's' }; // 启动/停止连点（Ctrl+Alt+S）
+    const HOTKEY_PICK   = { ctrlKey: true, altKey: true, key: 'c' }; // 选择元素模式（Ctrl+Alt+C）
+
+    /************* 内部变量 *************/
+    let targetElement = null;      // 当前要连点的元素
+    let clickingTimer = null;      // setInterval 的句柄
+    let isPickingMode = false;     // 是否处于“选择元素模式”
+    let batchCount = 0;            // 当前轮已点击次数
+    let overlay = null;            // 用于高亮选中的遮罩
+    let lastPickedSelector = '';   // 记录大致选择器（展示用）
+
+    /************* 工具函数 *************/
+
+    function showMessage(msg, timeout = 2000) {
+        console.log('[连点器]', msg);
+        let div = document.createElement('div');
+        div.textContent = msg;
+        Object.assign(div.style, {
+            position: 'fixed',
+            zIndex: 999999,
+            left: '50%',
+            top: '20px',
+            transform: 'translateX(-50%)',
+            background: 'rgba(0,0,0,0.75)',
+            color: '#fff',
+            padding: '6px 12px',
+            borderRadius: '4px',
+            fontSize: '12px',
+            fontFamily: 'sans-serif',
+            pointerEvents: 'none'
+        });
+        document.body.appendChild(div);
+        setTimeout(() => div.remove(), timeout);
+    }
+
+    function isHotkey(e, conf) {
+        return (
+            !!conf &&
+            e.key.toLowerCase() === conf.key.toLowerCase() &&
+            !!e.ctrlKey === !!conf.ctrlKey &&
+            !!e.altKey === !!conf.altKey &&
+            !!e.shiftKey === !!conf.shiftKey
+        );
+    }
+
+    function startClicking() {
+        if (!targetElement || !document.body.contains(targetElement)) {
+            showMessage('未找到目标元素，请先按 Ctrl+Alt+C 选择元素');
+            stopClicking();
+            return;
+        }
+        if (clickingTimer) return; // 已在运行
+        showMessage('连点开始');
+        batchCount = 0;
+
+        clickingTimer = setInterval(() => {
+            if (!targetElement || !document.body.contains(targetElement)) {
+                showMessage('目标元素已不存在，停止连点');
+                stopClicking();
+                return;
+            }
+            try {
+                targetElement.click();
+                batchCount++;
+                if (batchCount >= MAX_CLICK_PER_BATCH) {
+                    // 停一会儿再继续
+                    clearInterval(clickingTimer);
+                    clickingTimer = null;
+                    showMessage(`本轮已点击 ${MAX_CLICK_PER_BATCH} 次，休息中...`);
+                    setTimeout(() => {
+                        batchCount = 0;
+                        startClicking();
+                    }, REST_AFTER_BATCH_MS);
+                }
+            } catch (err) {
+                console.error('[连点器] 点击出错：', err);
+            }
+        }, CLICK_INTERVAL_MS);
+    }
+
+    function stopClicking() {
+        if (clickingTimer) {
+            clearInterval(clickingTimer);
+            clickingTimer = null;
+            showMessage('连点已停止');
+        }
+    }
+
+    /************* 选择元素模式 *************/
+
+    function createOverlay() {
+        if (overlay) return overlay;
+        overlay = document.createElement('div');
+        Object.assign(overlay.style, {
+            position: 'absolute',
+            border: '2px solid #ff9800',
+            background: 'rgba(255,152,0,0.15)',
+            pointerEvents: 'none',
+            zIndex: 999998
+        });
+        document.body.appendChild(overlay);
+        return overlay;
+    }
+
+    function highlightElement(el) {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const ov = createOverlay();
+        Object.assign(ov.style, {
+            left: `${window.scrollX + rect.left}px`,
+            top: `${window.scrollY + rect.top}px`,
+            width: `${rect.width}px`,
+            height: `${rect.height}px`,
+            display: 'block'
+        });
+    }
+
+    function hideOverlay() {
+        if (overlay) {
+            overlay.style.display = 'none';
+        }
+    }
+
+    function buildSimpleSelector(el) {
+        if (!el || !el.tagName) return '';
+        let selector = el.tagName.toLowerCase();
+        if (el.id) {
+            selector += `#${el.id}`;
+        }
+        if (el.classList && el.classList.length) {
+            selector += '.' + Array.from(el.classList).slice(0, 3).join('.');
+        }
+        return selector;
+    }
+
+    function enablePickingMode() {
+        if (isPickingMode) return;
+        isPickingMode = true;
+        showMessage('选择元素模式：移动鼠标到目标元素，点击一次即可选中（或按 ESC 取消）', 4000);
+
+        const moveHandler = (e) => {
+            const el = e.target;
+            highlightElement(el);
+        };
+
+        const clickHandler = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const el = e.target;
+            targetElement = el;
+            lastPickedSelector = buildSimpleSelector(el);
+            hideOverlay();
+            disablePickingMode();
+            showMessage(`已选中元素：${lastPickedSelector || el.tagName}, 自动开始连点`);
+            startClicking();
+        };
+
+        const keyHandler = (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                hideOverlay();
+                disablePickingMode();
+                showMessage('已取消选择元素模式');
+            }
+        };
+
+        // 存在 window 上，方便移除
+        window.__autoClicker_pickHandlers = { moveHandler, clickHandler, keyHandler };
+
+        document.addEventListener('mousemove', moveHandler, true);
+        document.addEventListener('click', clickHandler, true);
+        document.addEventListener('keydown', keyHandler, true);
+    }
+
+    function disablePickingMode() {
+        if (!isPickingMode) return;
+        isPickingMode = false;
+
+        const handlers = window.__autoClicker_pickHandlers;
+        if (handlers) {
+            document.removeEventListener('mousemove', handlers.moveHandler, true);
+            document.removeEventListener('click', handlers.clickHandler, true);
+            document.removeEventListener('keydown', handlers.keyHandler, true);
+        }
+        window.__autoClicker_pickHandlers = null;
+    }
+
+    /************* 快捷键监听 *************/
+
+    document.addEventListener('keydown', (e) => {
+        // 避免在输入框/textarea 中乱触发
+        const tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) {
+            return;
+        }
+
+        // 启动/停止
+        if (isHotkey(e, HOTKEY_TOGGLE)) {
+            e.preventDefault();
+            if (clickingTimer) {
+                stopClicking();
+            } else {
+                startClicking();
+            }
+            return;
+        }
+
+        // 选择元素模式
+        if (isHotkey(e, HOTKEY_PICK)) {
+            e.preventDefault();
+            if (isPickingMode) {
+                disablePickingMode();
+                hideOverlay();
+                showMessage('已退出选择元素模式');
+            } else {
+                stopClicking(); // 切换目标前先停
+                enablePickingMode();
+            }
+        }
+    });
+
+    showMessage('通用连点器已加载：Ctrl+Alt+C 选择元素，Ctrl+Alt+S 启动/停止', 4000);
+})();

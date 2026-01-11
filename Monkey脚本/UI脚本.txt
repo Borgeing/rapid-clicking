@@ -1,0 +1,521 @@
+// ==UserScript==
+// @name         通用自定义连点器（带彩色拖拽圆环+参数配置）
+// @namespace    https://tampermonkey.net/
+// @version      1.0
+// @description  15色无缝渐变+流畅拖拽，解决渐变方向不一致问题
+// @author       You
+// @match        *://*/*
+// @grant        none
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    /************* 基础配置 *************/
+    /*疑似每每1000毫秒点一个赞，期间不退出重进,约五小时连续无限制提示.
+
+      每950毫秒点一个赞,每180秒自动退出重进一次直播间约用时10秒,约五小时连续无限制提示
+
+      每950毫秒点一个赞，每240秒自动退出重进一次直播间约用时10秒,约1个半小时到2小时左右提示受限制.*/
+    let CLICK_INTERVAL_MS = 1000;//连点间隔（毫秒），数值越小点得越快，例如 100 = 每秒约 10 次
+    let MAX_CLICK_PER_BATCH = 3000;//每轮最多点击次数
+    let REST_AFTER_BATCH_MS = 50000;//每轮结束后的休息时间（毫秒）
+    const HOTKEY_TOGGLE = { ctrlKey: true, altKey: true, key: 's' };
+    const HOTKEY_PICK = { ctrlKey: true, altKey: true, key: 'c' };
+    const DRAG_THRESHOLD = 3;
+
+    /************* 内部变量 *************/
+    let targetElement = null;
+    let clickingTimer = null;
+    let isPickingMode = false;
+    let batchCount = 0;
+    let overlay = null;
+    let lastPickedSelector = '';
+    let isPanelMinimized = false;
+
+    /************* 创建动态SVG圆环+参数面板 *************/
+    function createCircleAndPanel() {
+        const style = document.createElement('style');
+        style.textContent = `
+            /* 核心修改：使用SVG圆环样式 */
+            .clicker-circle {
+                position: fixed;
+                width: 40px;
+                height: 40px;
+                cursor: move;
+                z-index: 999999;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: #fff;
+                font-weight: bold;
+                font-size: 14px;
+                transition: all 0.2s ease;
+                pointer-events: auto;
+                user-select: none;
+                -webkit-user-select: none;
+            }
+            .clicker-circle:hover {
+                transform: scale(1.2);
+            }
+            .clicker-circle svg {
+                width: 100%;
+                height: 100%;
+            }
+            .clicker-circle text {
+                pointer-events: none;
+                font-size: 14px;
+                font-family: sans-serif;
+            }
+            /* 参数面板样式（保持原有） */
+            .clicker-panel {
+                position: fixed;
+                width: 320px;
+                background: #fff;
+                border-radius: 8px;
+                box-shadow: 0 4px 20px rgba(0,0,0,0.15);
+                padding: 16px;
+                z-index: 999998;
+                display: none;
+                flex-direction: column;
+                gap: 12px;
+            }
+            .panel-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                border-bottom: 1px solid #eee;
+                padding-bottom: 8px;
+            }
+            .panel-title {
+                font-size: 16px;
+                font-weight: 600;
+                color: #333;
+            }
+            /* 快捷键提示区域 */
+            .hotkey-tip {
+                padding: 8px;
+                background: #f5fafe;
+                border-radius: 4px;
+                font-size: 12px;
+                color: #666;
+                line-height: 1.5;
+            }
+            .hotkey-item {
+                display: flex;
+                justify-content: space-between;
+                margin: 4px 0;
+            }
+            .hotkey-combo {
+                font-weight: 600;
+                color: #ff9800;
+            }
+            .panel-btn {
+                padding: 4px 8px;
+                border: none;
+                border-radius: 4px;
+                background: #f5f5f5;
+                cursor: pointer;
+                transition: background 0.2s;
+            }
+            .panel-btn:hover {
+                background: #eee;
+            }
+            .panel-btn.min-btn {
+                background: #4caf50;
+                color: #fff;
+            }
+            .panel-btn.save-btn {
+                background: #ff9800;
+                color: #fff;
+            }
+            .param-group {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .param-label {
+                font-size: 12px;
+                color: #666;
+            }
+            .param-input {
+                padding: 6px 8px;
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                font-size: 14px;
+            }
+            .param-input:focus {
+                outline: none;
+                border-color: #ff9800;
+            }
+            .panel-footer {
+                display: flex;
+                justify-content: flex-end;
+                gap: 8px;
+                padding-top: 8px;
+                border-top: 1px solid #eee;
+            }
+        `;
+        document.head.appendChild(style);
+
+        // 创建SVG圆环容器
+        const circleContainer = document.createElement('div');
+        circleContainer.className = 'clicker-circle';
+        circleContainer.style.left = '50px';
+        circleContainer.style.top = '50px';
+
+        // 添加SVG内容
+        circleContainer.innerHTML = `
+    <svg viewBox="0 0 500 500" preserveAspectRatio="xMidYMid meet">
+        <defs>
+            <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="100%">
+                <stop offset="0%" style="stop-color:#00ffff;">
+                    <animate attributeName="stop-color"
+                        values="#00ffff;#ff00ff;#ffff00;#00ffff"
+                        dur="10s" repeatCount="indefinite" />
+                </stop>
+                <stop offset="100%" style="stop-color:#ff00ff;">
+                    <animate attributeName="stop-color"
+                        values="#ff00ff;#ffff00;#00ffff;#ff00ff"
+                        dur="10s" repeatCount="indefinite" />
+                </stop>
+            </linearGradient>
+            <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+                <feGaussianBlur stdDeviation="5" result="coloredBlur"/>
+                <feMerge>
+                    <feMergeNode in="coloredBlur"/>
+                    <feMergeNode in="SourceGraphic"/>
+                </feMerge>
+            </filter>
+        </defs>
+        <circle cx="250" cy="250" r="150"
+              fill="none"
+              stroke="url(#gradient)"
+              stroke-width="40"
+              filter="url(#glow)"/>
+    </svg>
+`;;
+        document.body.appendChild(circleContainer);
+
+        // 参数面板（保持原有）
+        const panel = document.createElement('div');
+        panel.className = 'clicker-panel';
+        panel.innerHTML = `
+            <div class="panel-header">
+                <div class="panel-title">连点参数配置</div>
+                <button class="panel-btn min-btn" id="minimizeBtn">缩小</button>
+            </div>
+            <div class="hotkey-tip">
+                <div class="hotkey-item">
+                    <span>选择连点元素：</span>
+                    <span class="hotkey-combo">Ctrl+Alt+C</span>
+                </div>
+                <div class="hotkey-item">
+                    <span>启动/停止连点：</span>
+                    <span class="hotkey-combo">Ctrl+Alt+S</span>
+                </div>
+            </div>
+            <div class="param-group">
+                <label class="param-label">连点间隔（毫秒）</label>
+                <input type="number" class="param-input" id="intervalInput" value="${CLICK_INTERVAL_MS}" min="10" max="1000">
+            </div>
+            <div class="param-group">
+                <label class="param-label">每轮最大点击次数</label>
+                <input type="number" class="param-input" id="batchInput" value="${MAX_CLICK_PER_BATCH}" min="1" max="1000">
+            </div>
+            <div class="param-group">
+                <label class="param-label">每轮休息时间（毫秒）</label>
+                <input type="number" class="param-input" id="restInput" value="${REST_AFTER_BATCH_MS}" min="0" max="10000">
+            </div>
+            <div class="panel-footer">
+                <button class="panel-btn" id="cancelBtn">取消</button>
+                <button class="panel-btn save-btn" id="saveBtn">保存生效</button>
+            </div>
+        `;
+        document.body.appendChild(panel);
+
+        // 流畅拖拽功能
+        smoothDragModel(circleContainer);
+
+        // 圆环点击事件
+        circleContainer.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (isPanelMinimized) {
+                panel.style.display = 'flex';
+                const rect = circleContainer.getBoundingClientRect();
+                panel.style.left = `${rect.right + 10}px`;
+                panel.style.top = `${rect.top}px`;
+                isPanelMinimized = false;
+            } else {
+                panel.style.display = panel.style.display === 'flex' ? 'none' : 'flex';
+                const rect = circleContainer.getBoundingClientRect();
+                panel.style.left = `${rect.right + 10}px`;
+                panel.style.top = `${rect.top}px`;
+            }
+        });
+
+        // 面板按钮事件
+        document.getElementById('minimizeBtn').addEventListener('click', () => {
+            panel.style.display = 'none';
+            isPanelMinimized = true;
+        });
+        document.getElementById('cancelBtn').addEventListener('click', () => {
+            panel.style.display = 'none';
+            document.getElementById('intervalInput').value = CLICK_INTERVAL_MS;
+            document.getElementById('batchInput').value = MAX_CLICK_PER_BATCH;
+            document.getElementById('restInput').value = REST_AFTER_BATCH_MS;
+        });
+        document.getElementById('saveBtn').addEventListener('click', () => {
+            CLICK_INTERVAL_MS = parseInt(document.getElementById('intervalInput').value) || 300;
+            MAX_CLICK_PER_BATCH = parseInt(document.getElementById('batchInput').value) || 50;
+            REST_AFTER_BATCH_MS = parseInt(document.getElementById('restInput').value) || 2000;
+            showMessage('参数已保存，立即生效');
+            panel.style.display = 'none';
+        });
+    }
+
+    /************* 流畅拖拽逻辑 *************/
+    function smoothDragModel(dragElement) {
+        let isDragging = false;
+        let startX = 0;
+        let startY = 0;
+        let elementX = 0;
+        let elementY = 0;
+        let dragStartDistance = 0;
+        let animationFrameId = null;
+
+        dragElement.addEventListener('mousedown', (e) => {
+            if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+
+            e.preventDefault();
+            e.stopPropagation();
+
+            startX = e.clientX;
+            startY = e.clientY;
+            elementX = dragElement.offsetLeft;
+            elementY = dragElement.offsetTop;
+
+            document.body.classList.add('dragging');
+            isDragging = false;
+
+            document.addEventListener('mousemove', handleMouseMove);
+            document.addEventListener('mouseup', handleMouseUp);
+        });
+
+        function handleMouseMove(e) {
+            if (!document.body.classList.contains('dragging')) return;
+
+            const deltaX = e.clientX - startX;
+            const deltaY = e.clientY - startY;
+            dragStartDistance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+
+            if (!isDragging) {
+                if (dragStartDistance > DRAG_THRESHOLD) {
+                    isDragging = true;
+                } else {
+                    return;
+                }
+            }
+
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            animationFrameId = requestAnimationFrame(() => {
+                let newLeft = elementX + deltaX;
+                let newTop = elementY + deltaY;
+
+                newLeft = Math.max(0, Math.min(newLeft, window.innerWidth - dragElement.offsetWidth));
+                newTop = Math.max(0, Math.min(newTop, window.innerHeight - dragElement.offsetHeight));
+
+                dragElement.style.left = `${newLeft}px`;
+                dragElement.style.top = `${newTop}px`;
+            });
+        }
+
+        function handleMouseUp() {
+            if (animationFrameId) cancelAnimationFrame(animationFrameId);
+            document.removeEventListener('mousemove', handleMouseMove);
+            document.removeEventListener('mouseup', handleMouseUp);
+
+            document.body.classList.remove('dragging');
+            isDragging = false;
+            dragStartDistance = 0;
+        }
+    }
+
+    /************* 核心功能 *************/
+    function showMessage(msg, timeout = 2000) {
+        console.log('[连点器]', msg);
+        let div = document.createElement('div');
+        div.textContent = msg;
+        Object.assign(div.style, {
+            position: 'fixed',
+            zIndex: 999999,
+            left: '50%',
+            top: '20px',
+            transform: 'translateX(-50%)',
+            background: 'rgba(0,0,0,0.75)',
+            color: '#fff',
+            padding: '6px 12px',
+            borderRadius: '4px',
+            fontSize: '12px',
+            fontFamily: 'sans-serif',
+            pointerEvents: 'none'
+        });
+        document.body.appendChild(div);
+        setTimeout(() => div.remove(), timeout);
+    }
+
+    function isHotkey(e, conf) {
+        return !!conf && e.key.toLowerCase() === conf.key.toLowerCase() &&
+            !!e.ctrlKey === !!conf.ctrlKey && !!e.altKey === !!conf.altKey &&
+            !!e.shiftKey === !!conf.shiftKey;
+    }
+
+    function startClicking() {
+        if (!targetElement || !document.body.contains(targetElement)) {
+            showMessage('未找到目标元素，请先按 Ctrl+Alt+C 选择元素');
+            stopClicking();
+            return;
+        }
+        if (clickingTimer) return;
+        showMessage('连点开始');
+        batchCount = 0;
+        clickingTimer = setInterval(() => {
+            if (!targetElement || !document.body.contains(targetElement)) {
+                showMessage('目标元素已不存在，停止连点');
+                stopClicking();
+                return;
+            }
+            try {
+                targetElement.click();
+                batchCount++;
+                if (batchCount >= MAX_CLICK_PER_BATCH) {
+                    clearInterval(clickingTimer);
+                    clickingTimer = null;
+                    showMessage(`本轮已点击 ${MAX_CLICK_PER_BATCH} 次，休息中...`);
+                    setTimeout(() => { batchCount = 0; startClicking(); }, REST_AFTER_BATCH_MS);
+                }
+            } catch (err) {
+                console.error('[连点器] 点击出错：', err);
+            }
+        }, CLICK_INTERVAL_MS);
+    }
+
+    function stopClicking() {
+        if (clickingTimer) {
+            clearInterval(clickingTimer);
+            clickingTimer = null;
+            showMessage('连点已停止');
+        }
+    }
+
+    // 选择元素模式
+    function createOverlay() {
+        if (overlay) return overlay;
+        overlay = document.createElement('div');
+        Object.assign(overlay.style, {
+            position: 'absolute',
+            border: '2px solid #ff9800',
+            background: 'rgba(255,152,0,0.15)',
+            pointerEvents: 'none',
+            zIndex: 999998
+        });
+        document.body.appendChild(overlay);
+        return overlay;
+    }
+
+    function highlightElement(el) {
+        if (!el) return;
+        const rect = el.getBoundingClientRect();
+        const ov = createOverlay();
+        Object.assign(ov.style, {
+            left: `${window.scrollX + rect.left}px`,
+            top: `${window.scrollY + rect.top}px`,
+            width: `${rect.width}px`,
+            height: `${rect.height}px`,
+            display: 'block'
+        });
+    }
+
+    function hideOverlay() {
+        if (overlay) overlay.style.display = 'none';
+    }
+
+    function buildSimpleSelector(el) {
+        if (!el || !el.tagName) return '';
+        let selector = el.tagName.toLowerCase();
+        if (el.id) selector += `#${el.id}`;
+        if (el.classList && el.classList.length) {
+            selector += '.' + Array.from(el.classList).slice(0, 3).join('.');
+        }
+        return selector;
+    }
+
+    function enablePickingMode() {
+        if (isPickingMode) return;
+        isPickingMode = true;
+        showMessage('选择元素模式：移动鼠标到目标元素，点击一次即可选中（ESC 取消）', 4000);
+        const moveHandler = (e) => highlightElement(e.target);
+        const clickHandler = (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            targetElement = e.target;
+            lastPickedSelector = buildSimpleSelector(e.target);
+            hideOverlay();
+            disablePickingMode();
+            showMessage(`已选中元素：${lastPickedSelector || e.target.tagName}, 自动开始连点`);
+            startClicking();
+        };
+        const keyHandler = (e) => {
+            if (e.key === 'Escape') {
+                e.preventDefault();
+                hideOverlay();
+                disablePickingMode();
+                showMessage('已取消选择元素模式');
+            }
+        };
+        window.__autoClicker_pickHandlers = { moveHandler, clickHandler, keyHandler };
+        document.addEventListener('mousemove', moveHandler, true);
+        document.addEventListener('click', clickHandler, true);
+        document.addEventListener('keydown', keyHandler, true);
+    }
+
+    function disablePickingMode() {
+        if (!isPickingMode) return;
+        isPickingMode = false;
+        const handlers = window.__autoClicker_pickHandlers;
+        if (handlers) {
+            document.removeEventListener('mousemove', handlers.moveHandler, true);
+            document.removeEventListener('click', handlers.clickHandler, true);
+            document.removeEventListener('keydown', handlers.keyHandler, true);
+        }
+        window.__autoClicker_pickHandlers = null;
+    }
+
+    // 快捷键监听
+    document.addEventListener('keydown', (e) => {
+        const tag = (e.target.tagName || '').toLowerCase();
+        if (tag === 'input' || tag === 'textarea' || e.target.isContentEditable) return;
+
+        if (isHotkey(e, HOTKEY_TOGGLE)) {
+            e.preventDefault();
+            clickingTimer ? stopClicking() : startClicking();
+            return;
+        }
+
+        if (isHotkey(e, HOTKEY_PICK)) {
+            e.preventDefault();
+            if (isPickingMode) {
+                disablePickingMode();
+                hideOverlay();
+                showMessage('已退出选择元素模式');
+            } else {
+                stopClicking();
+                enablePickingMode();
+            }
+        }
+    });
+
+    /************* 初始化 *************/
+    createCircleAndPanel();
+    showMessage('连点器已加载：点击圆环配置参数 | Ctrl+Alt+C 选元素 | Ctrl+Alt+S 启停', 5000);
+})();
